@@ -1,35 +1,60 @@
 import * as dotenv from "dotenv";
 import { ChatGroq } from "@langchain/groq";
-import { StateGraph, START, END } from "@langchain/langgraph";
-import { PromptTemplate } from "@langchain/core/prompts";
+import { StateGraph, START, END, MemorySaver, Annotation } from "@langchain/langgraph";
 import { Client } from "pg";
 import * as readline from 'readline/promises';
 import { stdin as input, stdout as output } from 'process';
+import { HumanMessage, AIMessage, SystemMessage } from "@langchain/core/messages";
 
-// Load environment variables (Mainly for GROQ_API_KEY now)
 dotenv.config();
 
 // --- Configuration ---
-const MAX_RETRIES = 3;
+const MAX_RETRIES = 5;
 
-// We will store the DB client globally but initialize it after user input
+// Global variables for DB connection and Schema
 let dbClient;
+let targetSchema = "public"; // Default to public
 
-// --- 1. Define the Graph State ---
-/*
-  Added 'dynamic_schema_context' to hold the schema we learn from the DB.
-*/
-const InitialState = {
-    question: "",
-    sql_query: null,
-    db_result: null,
-    error: null,
-    retry_count: 0,
-    dynamic_schema_context: null // <--- New State Variable
-};
+// --- 1. Define the Graph State (Using Annotation) ---
+const GraphState = Annotation.Root({
+    // Messages: Appends new messages to the history array
+    messages: Annotation({
+        reducer: (x, y) => x.concat(y),
+        default: () => [],
+    }),
+    // Schema: Overwrites with new value
+    schema_context: Annotation({
+        reducer: (x, y) => y ?? x,
+        default: () => null,
+    }),
+    // Current Question: Overwrites
+    current_question: Annotation({
+        reducer: (x, y) => y ?? x,
+        default: () => "",
+    }),
+    // SQL Query: Overwrites
+    sql_query: Annotation({
+        reducer: (x, y) => y ?? x,
+        default: () => null,
+    }),
+    // DB Result: Overwrites
+    db_result: Annotation({
+        reducer: (x, y) => y ?? x,
+        default: () => null,
+    }),
+    // Error: Overwrites
+    error: Annotation({
+        reducer: (x, y) => y ?? x,
+        default: () => null,
+    }),
+    // Retry Count: Overwrites
+    retry_count: Annotation({
+        reducer: (x, y) => y ?? x,
+        default: () => 0,
+    }),
+});
 
 // --- 2. Initialize Core Components ---
-// We still need the API Key from env, or you could prompt for this too.
 if (!process.env.GROQ_API_KEY) {
     console.error("❌ Error: GROQ_API_KEY is missing in .env file.");
     process.exit(1);
@@ -37,124 +62,106 @@ if (!process.env.GROQ_API_KEY) {
 
 const llm = new ChatGroq({
     apiKey: process.env.GROQ_API_KEY,
-    model: "llama3-70b-8192",
+    model: "openai/gpt-oss-120b",
     temperature: 0,
 });
 
+const memory = new MemorySaver();
+
 // --- 3. Define the Nodes ---
 
-/**
- * Node 0 (NEW): Introspects the database to get table definitions.
- * This runs ONCE at the beginning.
- */
-async function getIntrospectionNode(state) {
-    console.log(`\n🔍 Introspecting database schema...`);
+async function introspectionNode(state) {
+    if (state.schema_context) return {}; 
+
+    console.log(`\n🔍 Introspecting database schema: '${targetSchema}'...`);
     
-    // Query to get all tables and columns in the public schema
-    // You can adjust 'public' to a variable if needed.
+    // DYNAMIC SCHEMA INJECTION HERE
+    // We filter by table_schema = targetSchema
     const introspectionQuery = `
         SELECT table_name, column_name, data_type 
         FROM information_schema.columns 
-        WHERE table_schema = 'public' 
+        WHERE table_schema = '${targetSchema}' 
         ORDER BY table_name, ordinal_position;
     `;
 
     try {
         const res = await dbClient.query(introspectionQuery);
-        
-        if (res.rows.length === 0) {
-             return { error: "No tables found in 'public' schema. Cannot generate queries." };
-        }
+        if (res.rows.length === 0) return { error: `No tables found in schema '${targetSchema}'.` };
 
-        // Format the result into a string that looks like CREATE TABLE statements for the LLM
-        let schemaDescription = "Here is the database schema:\n";
+        let schema = `Database Schema (${targetSchema}): (NOTE: ALL NAMES ARE CASE SENSITIVE AND MUST BE QUOTED)\n`; // <-- ADDED NOTE
         let currentTable = "";
-
         res.rows.forEach(row => {
             if (row.table_name !== currentTable) {
                 currentTable = row.table_name;
-                schemaDescription += `\nTable: ${currentTable}\nColumns:\n`;
+                schema += `\nTable: ${currentTable}\nColumns:\n`;
             }
-            schemaDescription += `- ${row.column_name} (${row.data_type})\n`;
+            schema += `- ${row.column_name} (${row.data_type})\n`;
         });
 
-        console.log("✅ Schema loaded successfully.");
-        return { dynamic_schema_context: schemaDescription };
-
+        console.log("✅ Schema learned.");
+        return { schema_context: schema };
     } catch (err) {
         return { error: `Introspection Failed: ${err.message}` };
     }
 }
 
-/**
- * Node 1: Generates or corrects the SQL query using the DYNAMIC schema.
- */
 async function generateSqlNode(state) {
-    const { question, error, retry_count, dynamic_schema_context } = state;
-    
-    // Safety check: if introspection failed, we can't proceed
-    if (!dynamic_schema_context) {
-        return { error: "Schema context is missing." };
-    }
+    const { schema_context, current_question, messages, error, retry_count } = state;
 
-    console.log(`\n🤖 Attempt ${retry_count + 1}: Generating SQL query...`);
+    if (!schema_context) return { error: "Schema context missing." };
 
-    const systemPrompt = `
-        You are an expert PostgreSQL query translator. Your task is to convert a user's natural language question into a single, executable PostgreSQL SQL query.
+    console.log(`\n🤖 Attempt ${retry_count + 1}: Generating SQL...`);
+
+    const historyText = messages.map(m => 
+        `${m._getType() === 'human' ? 'User' : 'Assistant'}: ${m.content}`
+    ).join("\n");
+
+   const systemPrompt = `
+        You are an expert PostgreSQL Query Generator.
         
-        DATABASE SCHEMA CONTEXT:
-        ---
-        ${dynamic_schema_context}
-        ---
-        
-        - Only return the SQL query. Do NOT include any markdown formatting or explanatory text.
-        - IMPORTANT: If a previous ERROR is provided, analyze the error and correct your previous query to fix it.
-        - Always use a LIMIT clause (e.g., LIMIT 10) unless the user asks for a specific count.
+        ${schema_context}
+
+        INSTRUCTIONS:
+        1. **CRITICAL:** Use double quotes and the exact casing provided in the SCHEMA for all table and column names (e.g., SELECT "Task"."id" FROM "Task").
+        2. Generate a valid PostgreSQL query based on the User's Request.
+        3. Since this query must be portable, you MUST prefix all table names with the schema name '${targetSchema}' (e.g., use '${targetSchema}."users"' instead of '"users"').
+        4. If an ERROR is provided, fix the specific error.
+        5. Return ONLY the SQL query. No markdown.
     `;
 
-    const userPrompt = `
-        User Question: "${question}"
-        ${error ? `PREVIOUS ERROR: "${error}"\n--- CORRECT THE QUERY ABOVE ---` : ""}
-        
-        Generated SQL Query:
+    const userContent = `
+        Conversation History:
+        ${historyText}
+
+        Current User Request: "${current_question}"
+        ${error ? `PREVIOUS ERROR (Fix this): "${error}"` : ""}
     `;
 
-    const prompt = PromptTemplate.fromMessages([
-        ["system", systemPrompt],
-        ["user", userPrompt],
+    const result = await llm.invoke([
+        new SystemMessage(systemPrompt),
+        new HumanMessage(userContent)
     ]);
 
-    const chain = prompt.pipe(llm);
-    const result = await chain.invoke({});
     const sqlQuery = result.content.trim().replace(/^```[a-z]*\n?|```$/gmi, '').trim().replace(/;$/, ''); 
 
     return {
         sql_query: sqlQuery,
         error: null,
-        retry_count: retry_count + 1,
+        retry_count: retry_count + 1
     };
 }
 
-/**
- * Node 2: Executes the SQL query.
- */
 async function executeSqlNode(state) {
     const { sql_query } = state;
+    if (!sql_query) return { error: "No SQL generated." };
 
-    if (!sql_query) return { error: "SQL Query was not generated." };
-
-    console.log(`\nExecuting SQL: ${sql_query}`);
+    console.log(`\nExecuting: ${sql_query}`);
 
     try {
         const res = await dbClient.query(sql_query);
-        const resultString = JSON.stringify(res.rows, null, 2);
-        
-        if (res.rows.length === 0) {
-             return {
-                db_result: null,
-                error: `Query executed successfully but returned 0 rows. Please rewrite the query to find relevant data.`,
-            };
-        }
+        const resultString = res.rows.length > 0 
+            ? JSON.stringify(res.rows, null, 2)
+            : "No data found matching the query.";
 
         return { db_result: resultString, error: null };
     } catch (err) {
@@ -163,151 +170,131 @@ async function executeSqlNode(state) {
     }
 }
 
-/**
- * Node 3: Refines the response.
- */
 async function refineResponseNode(state) {
-    const { question, sql_query, db_result } = state;
+    const { current_question, sql_query, db_result } = state;
     
-    if (!db_result || !sql_query) return { error: "Refine node called without query result." };
+    console.log("\n✨ Formatting answer...");
 
-    console.log("\n✨ Formatting final response...");
+    const prompt = `
+        User asked: "${current_question}"
+        SQL Used: "${sql_query}"
+        Data Retrieved:
+        ${db_result}
 
-    const prompt = PromptTemplate.fromMessages([
-        ["system", "You are a helpful assistant. Take the user's original question and the structured database result, and combine them into a clear, natural language answer. Also, provide the SQL query used."],
-        ["human", `Original Question: "${question}"\nSQL Query Executed: "${sql_query}"\nDatabase Result:\n${db_result}`],
-    ]);
+        Provide a natural language answer summarizing the data.
+    `;
 
-    const chain = prompt.pipe(llm);
-    const result = await chain.invoke({});
+    const result = await llm.invoke(prompt);
 
-    return { db_result: result.content, error: null };
+    return { 
+        messages: [
+            new HumanMessage(current_question),
+            new AIMessage(result.content)
+        ],
+        db_result: result.content,
+        error: null,
+        retry_count: 0 
+    };
 }
 
-// --- 4. Define the Router ---
+// --- 4. Logic & Router ---
 
 function checkQueryStatus(state) {
     const { error, retry_count } = state;
-
     if (error) {
-        if (retry_count < MAX_RETRIES) {
-            console.log(`\n❌ Error detected. Retrying...`);
-            return "RETRY";
-        } else {
-            console.log("\n💀 Retry limit reached. Failing the process.");
-            return "FAIL";
-        }
-    } else {
-        console.log("\n✅ Query successful. Moving to final response.");
-        return "SUCCESS";
+        if (retry_count < MAX_RETRIES) return "RETRY";
+        return "FAIL";
     }
+    return "SUCCESS";
 }
 
-// --- 5. Main Execution Flow ---
+// --- 5. Build Graph ---
 
-async function runAgent(question) {
-    const workflow = new StateGraph()
-        .addNode("getIntrospection", getIntrospectionNode) // New Node
+function buildGraph() {
+    const workflow = new StateGraph(GraphState) 
+        .addNode("introspection", introspectionNode)
         .addNode("generateSql", generateSqlNode)
         .addNode("executeSql", executeSqlNode)
         .addNode("refineResponse", refineResponseNode);
 
-    // 1. Start -> Introspection (Get Schema first)
-    workflow.addEdge(START, "getIntrospection");
+    workflow.addEdge(START, "introspection");
+    
+    workflow.addConditionalEdges("introspection", 
+        (state) => state.error ? "FAIL" : "CONTINUE", 
+        { FAIL: END, CONTINUE: "generateSql" }
+    );
 
-    // 2. Introspection -> generateSql (Pass schema to LLM)
-    // We add a simple check here: if introspection fails, go to END
-    workflow.addConditionalEdges("getIntrospection", (state) => state.error ? "FAIL_INTRO" : "CONTINUE", {
-        FAIL_INTRO: END,
-        CONTINUE: "generateSql"
-    });
-
-    // 3. generateSql -> executeSql
     workflow.addEdge("generateSql", "executeSql");
     
-    // 4. Conditional Branching from executeSql
     workflow.addConditionalEdges("executeSql", checkQueryStatus, {
-        RETRY: "generateSql",     
-        SUCCESS: "refineResponse", 
-        FAIL: END,                 
+        RETRY: "generateSql",
+        SUCCESS: "refineResponse",
+        FAIL: END
     });
 
     workflow.addEdge("refineResponse", END);
 
-    const app = workflow.compile();
-
-    // Prepare initial state
-    const stateInput = {
-        ...InitialState,
-        question: question
-    };
-
-    console.log(`\n--- Starting SQL Agent for: "${question}" ---`);
-    const finalState = await app.invoke(stateInput);
-    console.log("\n--- Agent Run Complete ---");
-
-    if (finalState.db_result && !finalState.error) {
-        console.log("\n**Final Answer:**");
-        console.log(finalState.db_result); 
-    } else {
-        console.log("\n**Agent Failed.**");
-        console.log(`Last Error: ${finalState.error}`);
-    }
+    return workflow.compile({ checkpointer: memory });
 }
 
-// --- 6. Interactive CLI & Setup ---
+// --- 6. CLI Execution ---
 
 async function main() {
     const rl = readline.createInterface({ input, output });
 
-    console.log("\n👋 Welcome to the Universal SQL Agent!");
-    console.log("Please provide your PostgreSQL Connection Details.\n");
-
-    // Helper to get input with default value
-    const ask = async (query, defaultVal) => {
-        const answer = await rl.question(`${query} (${defaultVal}): `);
-        return answer.trim() || defaultVal;
-    };
-
+    console.log("\n👋 Universal SQL Agent (Multi-Turn)");
+    const ask = async (q, d) => { const a = await rl.question(`${q} (${d}): `); return a.trim() || d; };
+    
     try {
         const pgUser = await ask("PG User", "postgres");
         const pgHost = await ask("PG Host", "localhost");
         const pgDb = await ask("PG Database", "projectmanagment");
+        const pgSchemaInput = await ask("PG Schema", "public"); // <-- Ask for Schema
         const pgPass = await ask("PG Password", "password123");
         const pgPort = await ask("PG Port", "5432");
 
-        // Initialize Client with User Inputs
-        dbClient = new Client({
-            user: pgUser,
-            host: pgHost,
-            database: pgDb,
-            password: pgPass,
-            port: parseInt(pgPort),
-        });
+        // Set the global schema variable
+        targetSchema = pgSchemaInput;
 
-        console.log("\n🔌 Connecting to database...");
+        dbClient = new Client({ user: pgUser, host: pgHost, database: pgDb, password: pgPass, port: parseInt(pgPort) });
         await dbClient.connect();
-        console.log("✅ Connected!");
+        
+        // IMPORTANT: Set search_path for this session.
+        // This allows "SELECT * FROM users" to work even if users is inside "pm" schema.
+        await dbClient.query(`SET search_path TO "${targetSchema}"`);
+        
+        console.log(`✅ Connected to DB (Schema: ${targetSchema}).`);
 
-        // Loop for questions
+        const app = buildGraph();
+        const config = { configurable: { thread_id: "session_1" } };
+
+        console.log("\n🤖 Agent Ready! Ask questions (or type 'exit').");
+
         while (true) {
-            const question = await rl.question('\n❓ Ask your question in plain English (or type "exit"): ');
-            
-            if (question.toLowerCase() === 'exit') {
-                break;
-            }
+            const userInput = await rl.question('\n❓ You: ');
+            if (userInput.toLowerCase() === 'exit') break;
+            if (!userInput.trim()) continue;
 
-            if (question.trim()) {
-                await runAgent(question).catch(console.error);
+            const inputs = { 
+                current_question: userInput,
+                retry_count: 0, 
+                error: null
+            };
+
+            const finalState = await app.invoke(inputs, config);
+
+            if (finalState.error) {
+                console.log(`❌ Error: ${finalState.error}`);
+            } else if (finalState.db_result) {
+                console.log(`\n🤖 AI: ${finalState.db_result}`);
             }
         }
 
-    } catch (error) {
-        console.error("\n❌ Connection Failed or Error Occurred:", error.message);
+    } catch (e) {
+        console.error("Critical Error:", e);
     } finally {
         if (dbClient) await dbClient.end();
         rl.close();
-        console.log("\nGoodbye! 👋");
     }
 }
 

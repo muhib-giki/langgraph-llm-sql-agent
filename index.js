@@ -2,6 +2,13 @@ import readline from 'node:readline/promises';
 import { Client } from "pg";
 
 let dbClient;
+let PG_USER;
+let PG_HOST;
+let PG_DATABASE;
+let PG_SCHEMA;
+let PG_PASSWORD;
+let PG_PORT;
+
 /**
  * connect to a pgsql database
  * ask to user to write in plain english to generate a query on the connected db
@@ -24,12 +31,12 @@ async function getDbConnectionDetails() {
     }
 
     try {
-        const PG_USER = await ask("PG_USER: ", "postgres");
-        const PG_HOST = await ask("PG_HOST: ", "localhost");
-        const PG_DATABASE = await ask("PG_DATABASE: ", "postgres");
-        const PG_SCHEMA = await ask("PG_SCHEMA: ", "public");
-        const PG_PASSWORD = await ask("PG_PASSWORD: ", "password123");
-        const PG_PORT = await ask("PG_PORT: ", "5432");
+        PG_USER = await ask("PG_USER: ", "postgres");
+        PG_HOST = await ask("PG_HOST: ", "localhost");
+        PG_DATABASE = await ask("PG_DATABASE: ", "postgres");
+        PG_SCHEMA = await ask("PG_SCHEMA: ", "public");
+        PG_PASSWORD = await ask("PG_PASSWORD: ", "password123");
+        PG_PORT = await ask("PG_PORT: ", "5432");
     
         console.log(PG_USER);
         console.log(PG_HOST);
